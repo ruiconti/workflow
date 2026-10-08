@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import { deserialize, serialize } from 'node:v8';
 import { WorkflowWorldError } from '@workflow/errors';
+import type { WorldWrite } from './writes.js';
 
 /**
  * Oldest SQLite this world runs on. 3.51.3 fixes a WAL-reset bug that can
@@ -72,6 +73,21 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
   return sqliteModule;
 }
+
+export const WORLD_TABLES = [
+  'meta',
+  'runs',
+  'events',
+  'steps',
+  'hooks',
+  'hook_tokens',
+  'hook_resumes',
+  'waits',
+  'locks',
+  'stream_chunks',
+  'run_streams',
+  'snapshots',
+] as const;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -212,28 +228,50 @@ export class Db {
   private dataVersionStatement: StatementSync | undefined;
   private closed = false;
 
-  constructor(file: string) {
-    this.file = file;
+  private readonly owned: boolean;
+  private readonly onWrite?: (write: WorldWrite) => void;
+  private savepoint = 0;
+  private notifyEnabled = false;
+
+  constructor(
+    file: string | DatabaseSync,
+    onWrite?: (write: WorldWrite) => void
+  ) {
+    this.onWrite = onWrite;
+    this.owned = typeof file === 'string';
+    this.file =
+      typeof file === 'string'
+        ? file
+        : (
+            file as DatabaseSync & {
+              location?: (name: string) => string | null;
+            }
+          ).location?.('main') || ':memory:';
     const { DatabaseSync } = loadSqlite();
-    if (file !== ':memory:') {
+    if (typeof file === 'string' && file !== ':memory:') {
       mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
     }
-    const db = new DatabaseSync(file, { timeout: BUSY_TIMEOUT_MS });
+    const db =
+      typeof file === 'string'
+        ? new DatabaseSync(file, { timeout: BUSY_TIMEOUT_MS })
+        : file;
     this.raw = db;
     const version = (
       db.prepare('SELECT sqlite_version() AS v').get() as { v: string }
     ).v;
     if (compareVersions(version, MIN_SQLITE_VERSION) < 0) {
-      db.close();
+      if (this.owned) db.close();
       throw new SqliteVersionError(version);
     }
     // Must precede the first CREATE TABLE; a no-op on an existing store
     // created without it. Deleted rows are then returned to the filesystem
     // by `reclaimFreePages` instead of staying in the file as free pages.
-    db.exec('PRAGMA auto_vacuum = INCREMENTAL');
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec('PRAGMA synchronous = NORMAL');
-    db.exec('PRAGMA foreign_keys = OFF');
+    if (this.owned) {
+      db.exec('PRAGMA auto_vacuum = INCREMENTAL');
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
+      db.exec('PRAGMA foreign_keys = OFF');
+    }
     this.transaction(() => {
       db.exec(SCHEMA);
       const row = db
@@ -251,6 +289,14 @@ export class Db {
         );
       }
     });
+    this.notifyEnabled = true;
+  }
+
+  notifyWrite(write: WorldWrite): void {
+    const result: unknown = this.onWrite?.(write);
+    if (result && typeof (result as { then?: unknown }).then === 'function') {
+      throw new Error('onWrite must be synchronous');
+    }
   }
 
   get isOpen(): boolean {
@@ -275,32 +321,39 @@ export class Db {
   }
 
   run(sql: string, ...params: SqlValue[]): { changes: number } {
-    const result = this.statement(sql).run(...params);
-    return { changes: Number(result.changes) };
+    return this.transaction(() => {
+      const result = this.statement(sql).run(...params);
+      const changes = Number(result.changes);
+      if (changes > 0 && this.notifyEnabled)
+        this.notifyWrite({ kind: 'mutation', sql });
+      return { changes };
+    });
   }
 
   /**
    * Runs `fn` inside one write transaction (`BEGIN IMMEDIATE`). Nested calls
-   * join the outer transaction. `fn` must be synchronous: awaiting inside it
+   * use savepoints, including transactions opened by the host. `fn` must be synchronous: awaiting inside it
    * would let another caller on this connection start a transaction of its
    * own in the gap.
    */
   transaction<T>(fn: () => T): T {
-    if (this.raw.isTransaction) {
-      return fn();
-    }
-    this.raw.exec('BEGIN IMMEDIATE');
+    const nested = this.raw.isTransaction;
+    const savepoint = `world_sqlite_${++this.savepoint}`;
+    this.raw.exec(nested ? `SAVEPOINT ${savepoint}` : 'BEGIN IMMEDIATE');
     try {
       const result = fn();
       if (result instanceof Promise) {
         throw new Error('Db.transaction callbacks must be synchronous');
       }
-      this.reclaimFreePages();
-      this.raw.exec('COMMIT');
+      if (!nested && this.owned) this.reclaimFreePages();
+      this.raw.exec(nested ? `RELEASE ${savepoint}` : 'COMMIT');
       return result;
     } catch (error) {
       if (this.raw.isTransaction) {
-        this.raw.exec('ROLLBACK');
+        if (nested) {
+          this.raw.exec(`ROLLBACK TO ${savepoint}`);
+          this.raw.exec(`RELEASE ${savepoint}`);
+        } else this.raw.exec('ROLLBACK');
       }
       throw error;
     }
@@ -351,7 +404,7 @@ export class Db {
     this.closed = true;
     this.statements.clear();
     this.dataVersionStatement = undefined;
-    this.raw.close();
+    if (this.owned) this.raw.close();
   }
 }
 

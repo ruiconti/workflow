@@ -157,6 +157,7 @@ export function writeRun(ctx: Ctx, run: WorkflowRun): void {
     toMillis(run.createdAt),
     encode(run)
   );
+  ctx.db.notifyWrite({ kind: 'run', run });
 }
 
 /** Inserts a new run; false when the id is already taken. */
@@ -171,6 +172,7 @@ export function insertRun(ctx: Ctx, run: WorkflowRun): boolean {
     toMillis(run.createdAt),
     encode(run)
   );
+  if (changes > 0) ctx.db.notifyWrite({ kind: 'run', run });
   return changes > 0;
 }
 

@@ -94,13 +94,11 @@ export function purgeRunStreamData(db: Db, runId: string, tag: string): void {
 export function createStreamer(db: Db, tag?: string): Streamer {
   const tagValue = tag ?? '';
   const emitter = emitterFor(db);
-  const registeredStreams = new Set<string>();
 
   function registerStreamForRun(runId: string, streamName: string): void {
     assertSafeEntityId('runId', runId);
     assertSafeEntityId('streamName', streamName);
-    const key = `${runId}:${streamName}`;
-    if (registeredStreams.has(key)) return;
+
     // Copy-on-write, as world-local writes its tagged list: a tagged world's
     // first registration copies the untagged list it was reading, then
     // appends. The untagged list is never modified by a tagged world.
@@ -134,7 +132,6 @@ export function createStreamer(db: Db, tag?: string): Streamer {
         tagValue
       );
     });
-    registeredStreams.add(key);
   }
 
   function insertChunk(
@@ -183,6 +180,19 @@ export function createStreamer(db: Db, tag?: string): Streamer {
         db.transaction(() => {
           registerStreamForRun(runId, name);
           insertChunk(name, chunkId, bytes, false);
+          const heads = readChunkHeads(name).filter((head) => !head.eof);
+          db.notifyWrite({
+            kind: 'stream',
+            runId,
+            name,
+            chunks: [
+              {
+                index: heads.findIndex((head) => head.chunk_id === chunkId),
+                chunkId,
+                data: bytes,
+              },
+            ],
+          });
         });
         emitter.emit(`chunk:${name}`, {
           streamName: name,
@@ -205,6 +215,17 @@ export function createStreamer(db: Db, tag?: string): Streamer {
           payloads.forEach((bytes, i) => {
             insertChunk(name, chunkIds[i], bytes, false);
           });
+          const heads = readChunkHeads(name).filter((head) => !head.eof);
+          db.notifyWrite({
+            kind: 'stream',
+            runId,
+            name,
+            chunks: payloads.map((data, i) => ({
+              index: heads.findIndex((head) => head.chunk_id === chunkIds[i]),
+              chunkId: chunkIds[i],
+              data,
+            })),
+          });
         });
         payloads.forEach((bytes, i) => {
           emitter.emit(`chunk:${name}`, {
@@ -221,6 +242,13 @@ export function createStreamer(db: Db, tag?: string): Streamer {
         db.transaction(() => {
           registerStreamForRun(runId, name);
           insertChunk(name, chunkId, new Uint8Array(0), true);
+          db.notifyWrite({
+            kind: 'stream',
+            runId,
+            name,
+            chunks: [],
+            closed: true,
+          });
         });
         emitter.emit(`close:${name}`, { streamName: name });
       },
