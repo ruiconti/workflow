@@ -89,6 +89,18 @@ export const WORLD_TABLES = [
   'snapshots',
 ] as const;
 
+/** Table names owned by a world using this namespace. */
+export function worldTables(prefix = ''): string[] {
+  validateTablePrefix(prefix);
+  return WORLD_TABLES.map((name) => `${prefix}${name}`);
+}
+
+function validateTablePrefix(prefix: string): void {
+  if (prefix !== '' && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(prefix)) {
+    throw new TypeError('tablePrefix must match /^[A-Za-z_][A-Za-z0-9_]*$/');
+  }
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -209,6 +221,17 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 `;
 
+// Include every explicitly named schema index/trigger as well as every table.
+const SQL_NAMES = new Set<string>([
+  ...WORLD_TABLES,
+  ...Array.from(
+    SCHEMA.matchAll(
+      /CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g
+    ),
+    (match) => match[1]!
+  ),
+]);
+
 export type SqlValue = null | number | bigint | string | Uint8Array;
 export type Row = Record<string, SqlValue>;
 
@@ -224,6 +247,7 @@ export type Row = Record<string, SqlValue>;
 export class Db {
   readonly file: string;
   readonly raw: DatabaseSync;
+  private readonly tablePrefix: string;
   private readonly statements = new Map<string, StatementSync>();
   private dataVersionStatement: StatementSync | undefined;
   private closed = false;
@@ -235,8 +259,11 @@ export class Db {
 
   constructor(
     file: string | DatabaseSync,
-    onWrite?: (write: WorldWrite) => void
+    onWrite?: (write: WorldWrite) => void,
+    tablePrefix = ''
   ) {
+    validateTablePrefix(tablePrefix);
+    this.tablePrefix = tablePrefix;
     this.onWrite = onWrite;
     this.owned = typeof file === 'string';
     this.file =
@@ -273,13 +300,15 @@ export class Db {
       db.exec('PRAGMA foreign_keys = OFF');
     }
     this.transaction(() => {
-      db.exec(SCHEMA);
+      db.exec(this.sql(SCHEMA));
       const row = db
-        .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+        .prepare(
+          this.sql("SELECT value FROM meta WHERE key = 'schema_version'")
+        )
         .get() as { value: string } | undefined;
       if (!row) {
         db.prepare(
-          "INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
+          this.sql("INSERT INTO meta (key, value) VALUES ('schema_version', ?)")
         ).run(String(SCHEMA_VERSION));
       } else if (Number(row.value) > SCHEMA_VERSION) {
         throw new WorkflowWorldError(
@@ -303,10 +332,28 @@ export class Db {
     return !this.closed;
   }
 
+  /** Rewrite identifiers only, never literals or comments. All world SQL passes here. */
+  private sql(sql: string): string {
+    if (!this.tablePrefix) return sql;
+    return sql.replace(
+      /'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?\*\/|[A-Za-z_][A-Za-z0-9_]*/g,
+      (token) => {
+        const quote = token[0];
+        const quoted = quote === '"' || quote === '`' || quote === '[';
+        const name = quoted ? token.slice(1, -1) : token;
+        if (!SQL_NAMES.has(name)) return token;
+        const prefixed = `${this.tablePrefix}${name}`;
+        return quoted
+          ? `${quote}${prefixed}${quote === '[' ? ']' : quote}`
+          : prefixed;
+      }
+    );
+  }
+
   private statement(sql: string): StatementSync {
     let statement = this.statements.get(sql);
     if (!statement) {
-      statement = this.raw.prepare(sql);
+      statement = this.raw.prepare(this.sql(sql));
       this.statements.set(sql, statement);
     }
     return statement;
@@ -325,7 +372,7 @@ export class Db {
       const result = this.statement(sql).run(...params);
       const changes = Number(result.changes);
       if (changes > 0 && this.notifyEnabled)
-        this.notifyWrite({ kind: 'mutation', sql });
+        this.notifyWrite({ kind: 'mutation', sql: this.sql(sql) });
       return { changes };
     });
   }

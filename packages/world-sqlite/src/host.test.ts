@@ -4,7 +4,12 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { mintedSpecVersion } from '@workflow/world';
 import { expect, it } from 'vitest';
-import { createWorld, WORLD_TABLES, type WorldWrite } from './index.js';
+import {
+  createWorld,
+  WORLD_TABLES,
+  worldTables,
+  type WorldWrite,
+} from './index.js';
 
 const request = () => ({
   eventType: 'run_created' as const,
@@ -160,6 +165,94 @@ it('rolls back standalone snapshot writes inside an outer host transaction', asy
     database.exec('ROLLBACK');
   } finally {
     await world.close();
+    database.close();
+  }
+});
+
+it.each([
+  '',
+  'tagged',
+])('isolates prefixed tables from host meta (%s)', async (tag) => {
+  const database = new DatabaseSync(':memory:');
+  database.exec(
+    "CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('host', 'unchanged')"
+  );
+  const writes: WorldWrite[] = [];
+  const world = createWorld({
+    database,
+    tablePrefix: 'wf_',
+    tag,
+    onWrite: (write) => {
+      writes.push(write);
+    },
+  });
+  try {
+    const names = database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all()
+      .map((row) => row.name);
+    expect(names.sort()).toEqual(['meta', ...worldTables('wf_')].sort());
+    const indexes = database
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+      )
+      .all();
+    expect(indexes.length).toBeGreaterThan(0);
+    expect(indexes.every((row) => String(row.name).startsWith('wf_'))).toBe(
+      true
+    );
+    const result = await world.events.create(null, request());
+    const runId = result.run!.runId;
+    expect((await world.runs.get(runId)).runId).toBe(runId);
+    expect((await world.events.list({ runId })).data).toHaveLength(1);
+    await world.streams.writeMulti(runId, 'prefixed-stream', ['a', 'b']);
+    await world.streams.close(runId, 'prefixed-stream');
+    const reader = (
+      await world.streams.get(runId, 'prefixed-stream')
+    ).getReader();
+    const chunks: string[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(new TextDecoder().decode(value));
+    }
+    expect(chunks).toEqual(['a', 'b']);
+    expect(
+      writes
+        .filter((write) => write.kind === 'mutation')
+        .every((write) => write.sql.includes('wf_'))
+    ).toBe(true);
+    await world.clear();
+    for (const table of worldTables('wf_').filter(
+      (name) => name !== 'wf_meta'
+    )) {
+      expect(
+        database.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.n
+      ).toBe(0);
+    }
+    expect(database.prepare('SELECT name, value FROM meta').all()).toEqual([
+      { name: 'host', value: 'unchanged' },
+    ]);
+  } finally {
+    await world.close();
+    database.close();
+  }
+});
+
+it('validates table prefixes before touching a host database', () => {
+  const database = new DatabaseSync(':memory:');
+  try {
+    expect(worldTables()).toEqual(WORLD_TABLES);
+    for (const tablePrefix of ['1bad', 'wf-', 'x; DROP TABLE meta', 'x y']) {
+      expect(() => createWorld({ database, tablePrefix })).toThrow(
+        'tablePrefix'
+      );
+      expect(() => worldTables(tablePrefix)).toThrow('tablePrefix');
+    }
+    expect(database.prepare('SELECT name FROM sqlite_master').all()).toEqual(
+      []
+    );
+  } finally {
     database.close();
   }
 });

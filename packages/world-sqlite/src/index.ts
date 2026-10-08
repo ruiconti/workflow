@@ -23,6 +23,7 @@ export {
   SqliteUnavailableError,
   SqliteVersionError,
   WORLD_TABLES,
+  worldTables,
 } from './db.js';
 export { UnsafeEntityIdError } from './storage/common.js';
 
@@ -34,6 +35,8 @@ export type Config = LocalWorldConfig & {
   dbPath?: string;
   /** Already-open host connection. The world never changes pragmas or closes it. */
   database?: DatabaseSync;
+  /** Namespace for world tables and indexes. Empty by default for existing stores. */
+  tablePrefix?: string;
   /** Synchronous, in-transaction hook. Throwing rolls back the write. Defer
    * external side effects until the host commits (including outer transactions).
    * Mutation notifications cover all changed SQL rows; semantic notifications
@@ -85,7 +88,11 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
 
   // Opening checks the SQLite version and creates the schema, so a store
   // this runtime can't safely share fails here, at startup.
-  const db = new Db(config.database ?? dbPath, config.onWrite);
+  const db = new Db(
+    config.database ?? dbPath,
+    config.onWrite,
+    config.tablePrefix
+  );
   const queue = createQueue(config);
   const storage = createStorage(db, tag);
   const recoverActiveRuns = resolveRecoverActiveRuns(config);
