@@ -411,7 +411,11 @@ describe('streamer', () => {
       it('delivers chunks from a second SQLite connection without the emitter', async () => {
         const { testDir, streamer } = await setupStreamer();
         // world-sqlite: a separate connection exercises PRAGMA data_version polling.
-        const db = new Db(path.join(testDir, 'workflow.sqlite'));
+        const db = new Db(
+          path.join(testDir, 'workflow.sqlite'),
+          undefined,
+          process.env.WORLD_SQLITE_TEST_TABLE_PREFIX
+        );
         try {
           const writer = createSqliteStreamer(db);
           const reader = (

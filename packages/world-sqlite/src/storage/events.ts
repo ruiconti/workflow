@@ -1609,9 +1609,17 @@ export function createEventsStorage(
       assertSafeEntityId('correlationId', data.correlationId);
     }
     const afterCommit: (() => void)[] = [];
-    const result = db.transaction(() =>
-      createSync(runId, data, params, afterCommit)
-    );
+    const result = db.transaction(() => {
+      const result = createSync(runId, data, params, afterCommit);
+      if (result.event)
+        db.notifyWrite({
+          kind: 'event',
+          runId: result.event.runId,
+          event: result.event,
+          ...('run' in result && result.run ? { run: result.run } : {}),
+        });
+      return result;
+    });
     for (const fn of afterCommit) fn();
     return result;
   }

@@ -15,8 +15,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   directory = mkdtempSync(path.join(os.tmpdir(), 'sqlite-stream-race-'));
   const file = path.join(directory, 'workflow.sqlite');
-  db = new Db(file);
-  otherDb = new Db(file);
+  db = new Db(file, undefined, process.env.WORLD_SQLITE_TEST_TABLE_PREFIX);
+  otherDb = new Db(file, undefined, process.env.WORLD_SQLITE_TEST_TABLE_PREFIX);
 });
 
 afterEach(() => {

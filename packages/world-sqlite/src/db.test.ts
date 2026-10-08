@@ -176,3 +176,23 @@ describe('db', () => {
     expect('gone' in value).toBe(false);
   });
 });
+
+it('prefixes SQL identifiers without rewriting string literals or comments', () => {
+  const db = new Db(':memory:', undefined, 'wf_');
+  try {
+    db.run(
+      "INSERT INTO meta (key, value) VALUES ('runs', 'events') /* hooks */"
+    );
+    expect(
+      db.get('SELECT value FROM "meta" WHERE key = \'runs\' -- steps\n')
+    ).toEqual({ value: 'events' });
+    expect(db.get("SELECT value FROM [meta] WHERE key = 'runs'")).toEqual({
+      value: 'events',
+    });
+    expect(db.get("SELECT value FROM `meta` WHERE key = 'runs'")).toEqual({
+      value: 'events',
+    });
+  } finally {
+    db.close();
+  }
+});

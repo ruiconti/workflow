@@ -1,4 +1,9 @@
 import path from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
+import type { WorldWrite } from './writes.js';
+
+export type { WorldWrite } from './writes.js';
+
 import type { QueuePrefix, World } from '@workflow/world';
 import { mintedSpecVersion, reenqueueActiveRuns } from '@workflow/world';
 import {
@@ -17,6 +22,8 @@ export {
   SCHEMA_VERSION,
   SqliteUnavailableError,
   SqliteVersionError,
+  WORLD_TABLES,
+  worldTables,
 } from './db.js';
 export { UnsafeEntityIdError } from './storage/common.js';
 
@@ -26,6 +33,15 @@ export type Config = LocalWorldConfig & {
    * `<dataDir>/workflow.sqlite`.
    */
   dbPath?: string;
+  /** Already-open host connection. The world never changes pragmas or closes it. */
+  database?: DatabaseSync;
+  /** Namespace for world tables and indexes. Empty by default for existing stores. */
+  tablePrefix?: string;
+  /** Synchronous, in-transaction hook. Throwing rolls back the write. Defer
+   * external side effects until the host commits (including outer transactions).
+   * Mutation notifications cover all changed SQL rows; semantic notifications
+   * additionally describe events, runs, and streams. */
+  onWrite?: (write: WorldWrite) => void;
 };
 
 export type SqliteWorld = World & {
@@ -72,7 +88,11 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
 
   // Opening checks the SQLite version and creates the schema, so a store
   // this runtime can't safely share fails here, at startup.
-  const db = new Db(dbPath);
+  const db = new Db(
+    config.database ?? dbPath,
+    config.onWrite,
+    config.tablePrefix
+  );
   const queue = createQueue(config);
   const storage = createStorage(db, tag);
   const recoverActiveRuns = resolveRecoverActiveRuns(config);
@@ -117,7 +137,7 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
       }
     });
     // Hand the freed pages back so a cleared store is small again.
-    db.raw.exec('VACUUM');
+    if (!config.database && !db.raw.isTransaction) db.raw.exec('VACUUM');
   }
 
   return {
@@ -128,7 +148,7 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
       hookResumeDedup: true,
       hookForceClaim: true,
     },
-    dbPath,
+    dbPath: db.file,
     ...queue,
     ...storage,
     ...instrumentObject('world.streams', {

@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import { deserialize, serialize } from 'node:v8';
 import { WorkflowWorldError } from '@workflow/errors';
+import type { WorldWrite } from './writes.js';
 
 /**
  * Oldest SQLite this world runs on. 3.51.3 fixes a WAL-reset bug that can
@@ -71,6 +72,33 @@ function loadSqlite(): typeof import('node:sqlite') {
     throw new SqliteUnavailableError(error);
   }
   return sqliteModule;
+}
+
+export const WORLD_TABLES = [
+  'meta',
+  'runs',
+  'events',
+  'steps',
+  'hooks',
+  'hook_tokens',
+  'hook_resumes',
+  'waits',
+  'locks',
+  'stream_chunks',
+  'run_streams',
+  'snapshots',
+] as const;
+
+/** Table names owned by a world using this namespace. */
+export function worldTables(prefix = ''): string[] {
+  validateTablePrefix(prefix);
+  return WORLD_TABLES.map((name) => `${prefix}${name}`);
+}
+
+function validateTablePrefix(prefix: string): void {
+  if (prefix !== '' && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(prefix)) {
+    throw new TypeError('tablePrefix must match /^[A-Za-z_][A-Za-z0-9_]*$/');
+  }
 }
 
 const SCHEMA = `
@@ -193,6 +221,17 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 `;
 
+// Include every explicitly named schema index/trigger as well as every table.
+const SQL_NAMES = new Set<string>([
+  ...WORLD_TABLES,
+  ...Array.from(
+    SCHEMA.matchAll(
+      /CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g
+    ),
+    (match) => match[1]!
+  ),
+]);
+
 export type SqlValue = null | number | bigint | string | Uint8Array;
 export type Row = Record<string, SqlValue>;
 
@@ -208,40 +247,68 @@ export type Row = Record<string, SqlValue>;
 export class Db {
   readonly file: string;
   readonly raw: DatabaseSync;
+  private readonly tablePrefix: string;
   private readonly statements = new Map<string, StatementSync>();
   private dataVersionStatement: StatementSync | undefined;
   private closed = false;
 
-  constructor(file: string) {
-    this.file = file;
+  private readonly owned: boolean;
+  private readonly onWrite?: (write: WorldWrite) => void;
+  private savepoint = 0;
+  private notifyEnabled = false;
+
+  constructor(
+    file: string | DatabaseSync,
+    onWrite?: (write: WorldWrite) => void,
+    tablePrefix = ''
+  ) {
+    validateTablePrefix(tablePrefix);
+    this.tablePrefix = tablePrefix;
+    this.onWrite = onWrite;
+    this.owned = typeof file === 'string';
+    this.file =
+      typeof file === 'string'
+        ? file
+        : (
+            file as DatabaseSync & {
+              location?: (name: string) => string | null;
+            }
+          ).location?.('main') || ':memory:';
     const { DatabaseSync } = loadSqlite();
-    if (file !== ':memory:') {
+    if (typeof file === 'string' && file !== ':memory:') {
       mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
     }
-    const db = new DatabaseSync(file, { timeout: BUSY_TIMEOUT_MS });
+    const db =
+      typeof file === 'string'
+        ? new DatabaseSync(file, { timeout: BUSY_TIMEOUT_MS })
+        : file;
     this.raw = db;
     const version = (
       db.prepare('SELECT sqlite_version() AS v').get() as { v: string }
     ).v;
     if (compareVersions(version, MIN_SQLITE_VERSION) < 0) {
-      db.close();
+      if (this.owned) db.close();
       throw new SqliteVersionError(version);
     }
     // Must precede the first CREATE TABLE; a no-op on an existing store
     // created without it. Deleted rows are then returned to the filesystem
     // by `reclaimFreePages` instead of staying in the file as free pages.
-    db.exec('PRAGMA auto_vacuum = INCREMENTAL');
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec('PRAGMA synchronous = NORMAL');
-    db.exec('PRAGMA foreign_keys = OFF');
+    if (this.owned) {
+      db.exec('PRAGMA auto_vacuum = INCREMENTAL');
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
+      db.exec('PRAGMA foreign_keys = OFF');
+    }
     this.transaction(() => {
-      db.exec(SCHEMA);
+      db.exec(this.sql(SCHEMA));
       const row = db
-        .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+        .prepare(
+          this.sql("SELECT value FROM meta WHERE key = 'schema_version'")
+        )
         .get() as { value: string } | undefined;
       if (!row) {
         db.prepare(
-          "INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
+          this.sql("INSERT INTO meta (key, value) VALUES ('schema_version', ?)")
         ).run(String(SCHEMA_VERSION));
       } else if (Number(row.value) > SCHEMA_VERSION) {
         throw new WorkflowWorldError(
@@ -251,16 +318,42 @@ export class Db {
         );
       }
     });
+    this.notifyEnabled = true;
+  }
+
+  notifyWrite(write: WorldWrite): void {
+    const result: unknown = this.onWrite?.(write);
+    if (result && typeof (result as { then?: unknown }).then === 'function') {
+      throw new Error('onWrite must be synchronous');
+    }
   }
 
   get isOpen(): boolean {
     return !this.closed;
   }
 
+  /** Rewrite identifiers only, never literals or comments. All world SQL passes here. */
+  private sql(sql: string): string {
+    if (!this.tablePrefix) return sql;
+    return sql.replace(
+      /'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?\*\/|[A-Za-z_][A-Za-z0-9_]*/g,
+      (token) => {
+        const quote = token[0];
+        const quoted = quote === '"' || quote === '`' || quote === '[';
+        const name = quoted ? token.slice(1, -1) : token;
+        if (!SQL_NAMES.has(name)) return token;
+        const prefixed = `${this.tablePrefix}${name}`;
+        return quoted
+          ? `${quote}${prefixed}${quote === '[' ? ']' : quote}`
+          : prefixed;
+      }
+    );
+  }
+
   private statement(sql: string): StatementSync {
     let statement = this.statements.get(sql);
     if (!statement) {
-      statement = this.raw.prepare(sql);
+      statement = this.raw.prepare(this.sql(sql));
       this.statements.set(sql, statement);
     }
     return statement;
@@ -275,32 +368,39 @@ export class Db {
   }
 
   run(sql: string, ...params: SqlValue[]): { changes: number } {
-    const result = this.statement(sql).run(...params);
-    return { changes: Number(result.changes) };
+    return this.transaction(() => {
+      const result = this.statement(sql).run(...params);
+      const changes = Number(result.changes);
+      if (changes > 0 && this.notifyEnabled)
+        this.notifyWrite({ kind: 'mutation', sql: this.sql(sql) });
+      return { changes };
+    });
   }
 
   /**
    * Runs `fn` inside one write transaction (`BEGIN IMMEDIATE`). Nested calls
-   * join the outer transaction. `fn` must be synchronous: awaiting inside it
+   * use savepoints, including transactions opened by the host. `fn` must be synchronous: awaiting inside it
    * would let another caller on this connection start a transaction of its
    * own in the gap.
    */
   transaction<T>(fn: () => T): T {
-    if (this.raw.isTransaction) {
-      return fn();
-    }
-    this.raw.exec('BEGIN IMMEDIATE');
+    const nested = this.raw.isTransaction;
+    const savepoint = `world_sqlite_${++this.savepoint}`;
+    this.raw.exec(nested ? `SAVEPOINT ${savepoint}` : 'BEGIN IMMEDIATE');
     try {
       const result = fn();
       if (result instanceof Promise) {
         throw new Error('Db.transaction callbacks must be synchronous');
       }
-      this.reclaimFreePages();
-      this.raw.exec('COMMIT');
+      if (!nested && this.owned) this.reclaimFreePages();
+      this.raw.exec(nested ? `RELEASE ${savepoint}` : 'COMMIT');
       return result;
     } catch (error) {
       if (this.raw.isTransaction) {
-        this.raw.exec('ROLLBACK');
+        if (nested) {
+          this.raw.exec(`ROLLBACK TO ${savepoint}`);
+          this.raw.exec(`RELEASE ${savepoint}`);
+        } else this.raw.exec('ROLLBACK');
       }
       throw error;
     }
@@ -351,7 +451,7 @@ export class Db {
     this.closed = true;
     this.statements.clear();
     this.dataVersionStatement = undefined;
-    this.raw.close();
+    if (this.owned) this.raw.close();
   }
 }
 

@@ -10,7 +10,11 @@ export function dbFor(basedir: string): Db {
   const key = path.resolve(basedir);
   let db = dbs.get(key);
   if (!db || !db.isOpen) {
-    db = new Db(path.join(key, 'workflow.sqlite'));
+    db = new Db(
+      path.join(key, 'workflow.sqlite'),
+      undefined,
+      process.env.WORLD_SQLITE_TEST_TABLE_PREFIX
+    );
     dbs.set(key, db);
   }
   return db;
