@@ -118,9 +118,9 @@ it('rolls back world and host rows when the hook throws, including savepoints', 
     await expect(
       world.streams.write('wrun_host', 'host-stream', 'bad')
     ).rejects.toThrow('host rejected');
-    expect(
-      database.prepare('SELECT count(*) AS n FROM stream_chunks').get()?.n
-    ).toBe(0);
+    expect(database.prepare('SELECT count(*) AS n FROM chunks').get()?.n).toBe(
+      0
+    );
     expect(await world.streams.list('wrun_host')).toEqual([]);
     fail = false;
     await world.streams.write('wrun_host', 'host-stream', 'good');

@@ -28,20 +28,13 @@ afterEach(() => {
 });
 
 it('polls a commit made between the backlog read and version capture', async () => {
-  const originalAll = db.all.bind(db);
+  const originalAll = db.get.bind(db);
   let injected = false;
-  vi.spyOn(db, 'all').mockImplementation((sql, ...params) => {
+  vi.spyOn(db, 'get').mockImplementation((sql, ...params) => {
     const rows = originalAll(sql, ...params);
-    if (!injected && sql.includes('SELECT chunk_id, eof, data')) {
+    if (!injected && sql.includes('SELECT id, next_idx, closed')) {
       injected = true;
-      otherDb.run(
-        'INSERT INTO stream_chunks (stream_name, chunk_id, tag, eof, data) VALUES (?, ?, ?, ?, ?)',
-        name,
-        'chnk_00000000000000000000000001',
-        '',
-        0,
-        new TextEncoder().encode('remote')
-      );
+      createStreamer(otherDb).streams.appendSync(runId, name, ['remote']);
     }
     return rows;
   });

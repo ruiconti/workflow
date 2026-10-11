@@ -14,7 +14,7 @@ import {
 } from '@workflow/world-local';
 import { Db } from './db.js';
 import { createStorage } from './storage/index.js';
-import { createStreamer } from './streamer.js';
+import { createStreamer, type SqliteStreamer } from './streamer.js';
 
 export {
   compareVersions,
@@ -25,6 +25,8 @@ export {
   WORLD_TABLES,
   worldTables,
 } from './db.js';
+export { StreamClosedError, StreamOperationConflictError } from './streamer.js';
+export type { AppendOptions, AppendResult } from './streamer.js';
 export { UnsafeEntityIdError } from './storage/common.js';
 
 export type Config = LocalWorldConfig & {
@@ -44,12 +46,13 @@ export type Config = LocalWorldConfig & {
   onWrite?: (write: WorldWrite) => void;
 };
 
-export type SqliteWorld = World & {
-  registerHandler(prefix: QueuePrefix, handler: DirectHandler): void;
-  clear(): Promise<void>;
-  /** Absolute path of the database file. */
-  readonly dbPath: string;
-};
+export type SqliteWorld = World &
+  SqliteStreamer & {
+    registerHandler(prefix: QueuePrefix, handler: DirectHandler): void;
+    clear(): Promise<void>;
+    /** Absolute path of the database file. */
+    readonly dbPath: string;
+  };
 
 function resolveRecoverActiveRuns(config: Partial<Config>): boolean {
   if (config.recoverActiveRuns !== undefined) return config.recoverActiveRuns;
@@ -63,7 +66,7 @@ const ENTITY_TABLES = [
   'steps',
   'hooks',
   'waits',
-  'stream_chunks',
+  'streams',
   'run_streams',
 ] as const;
 
@@ -110,7 +113,30 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
         'DELETE FROM hook_resumes WHERE run_id IN (SELECT run_id FROM runs WHERE tag = ?)',
         tagValue
       );
-      for (const table of ENTITY_TABLES) {
+      for (const table of ['chunks', 'stream_ops']) {
+        db.run(
+          `DELETE FROM ${table} WHERE stream_id IN (SELECT id FROM streams WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM run_streams r WHERE r.stream_name = streams.name AND r.tag != ?))`,
+          tagValue,
+          tagValue
+        );
+      }
+      // Stream contents have one owner, not a tag per chunk. Keep shared names
+      // intact while another tag still registers them.
+      db.run(
+        'DELETE FROM streams WHERE tag = ? AND NOT EXISTS (SELECT 1 FROM run_streams r WHERE r.stream_name = streams.name AND r.tag != ?)',
+        tagValue,
+        tagValue
+      );
+      // Transfer ownership when the clearing tag leaves a shared stream.
+      db.run(
+        'UPDATE streams SET tag = (SELECT min(r.tag) FROM run_streams r WHERE r.stream_name = streams.name AND r.tag != ?) WHERE tag = ? AND EXISTS (SELECT 1 FROM run_streams r WHERE r.stream_name = streams.name AND r.tag != ?)',
+        tagValue,
+        tagValue,
+        tagValue
+      );
+      for (const table of ENTITY_TABLES.filter(
+        (table) => table !== 'streams'
+      )) {
         db.run(`DELETE FROM ${table} WHERE tag = ?`, tagValue);
       }
       // Every claim this instance writes carries its `.<tag>` suffix.
@@ -127,6 +153,8 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
   function clearAll(): void {
     db.transaction(() => {
       for (const table of [
+        'chunks',
+        'stream_ops',
         ...ENTITY_TABLES,
         'hook_tokens',
         'hook_resumes',

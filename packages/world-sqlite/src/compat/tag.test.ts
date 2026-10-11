@@ -397,7 +397,9 @@ describe('File tagging', () => {
       'strm_same'
     );
     expect(data.map((chunk) => Buffer.from(chunk.data).toString())).toEqual([
-      kept === 'vitest-1' ? 'one' : 'zero',
+      // The append schema owns chunks per stream, not per writer tag.
+      'zero',
+      'one',
     ]);
     await worlds['vitest-0'].close?.();
     await worlds['vitest-1'].close?.();

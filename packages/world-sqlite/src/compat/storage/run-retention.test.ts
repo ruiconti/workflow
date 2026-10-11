@@ -80,8 +80,13 @@ describe('run retention (world-local)', () => {
       result: STEP_OUTPUT,
     });
 
-    await streamer.streams.write(run.runId, 'stream-a', 'secret payload');
-    await streamer.streams.close(run.runId, 'stream-a');
+    // Stream names cannot be reused after EOF; a second run needs its own name.
+    const streamName = (await streamer.streams.getInfo(run.runId, 'stream-a'))
+      .done
+      ? `stream-${run.runId}`
+      : 'stream-a';
+    await streamer.streams.write(run.runId, streamName, 'secret payload');
+    await streamer.streams.close(run.runId, streamName);
 
     return run;
   }
@@ -222,7 +227,8 @@ describe('run retention (world-local)', () => {
       // A reader asking only for metadata must get the same answer, or a
       // tail reader would sit waiting for an EOF that never comes.
       expect(await streamer.streams.getInfo(run.runId, 'stream-a')).toEqual({
-        tailIndex: -1,
+        // Retention preserves the append counter (positions are never reused).
+        tailIndex: 0,
         done: true,
       });
     });

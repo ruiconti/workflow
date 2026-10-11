@@ -14,7 +14,7 @@ import type { WorldWrite } from './writes.js';
 export const MIN_SQLITE_VERSION = '3.51.3';
 
 /** Schema version stored in `meta.schema_version`. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * Free pages (4 KiB each) a store keeps for upcoming writes; above this, each
@@ -84,7 +84,9 @@ export const WORLD_TABLES = [
   'hook_resumes',
   'waits',
   'locks',
-  'stream_chunks',
+  'streams',
+  'chunks',
+  'stream_ops',
   'run_streams',
   'snapshots',
 ] as const;
@@ -198,14 +200,29 @@ CREATE TABLE IF NOT EXISTS locks (
   data TEXT NOT NULL DEFAULT ''
 );
 
-CREATE TABLE IF NOT EXISTS stream_chunks (
-  stream_name TEXT NOT NULL,
-  chunk_id TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS streams (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  run_id TEXT NOT NULL,
   tag TEXT NOT NULL,
-  eof INTEGER NOT NULL,
-  data BLOB NOT NULL,
-  PRIMARY KEY (stream_name, chunk_id)
+  next_idx INTEGER NOT NULL DEFAULT 0,
+  closed INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS chunks (
+  stream_id INTEGER NOT NULL,
+  idx INTEGER NOT NULL,
+  data BLOB NOT NULL,
+  PRIMARY KEY (stream_id, idx)
+) WITHOUT ROWID;
+-- Operation-record retention is intentionally out of scope.
+CREATE TABLE IF NOT EXISTS stream_ops (
+  stream_id INTEGER NOT NULL,
+  op_id TEXT NOT NULL,
+  from_idx INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  digest TEXT NOT NULL,
+  PRIMARY KEY (stream_id, op_id)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS run_streams (
   run_id TEXT NOT NULL,
@@ -224,6 +241,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
 // Include every explicitly named schema index/trigger as well as every table.
 const SQL_NAMES = new Set<string>([
   ...WORLD_TABLES,
+  'stream_chunks', // Legacy identifier, used only during migration.
   ...Array.from(
     SCHEMA.matchAll(
       /CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)/g
@@ -317,6 +335,33 @@ export class Db {
             `Upgrade @workflow/world-sqlite.`
         );
       }
+      const legacy = db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"
+        )
+        .get(`${this.tablePrefix}stream_chunks`);
+      if (legacy) {
+        db.exec(
+          this.sql(`
+          INSERT INTO streams (name, run_id, tag, next_idx, closed)
+          SELECT c.stream_name,
+            coalesce(r.run_id, ''),
+            min(c.tag),
+            CASE WHEN max(c.chunk_id = 'chnk_00000000000000000000000000' AND c.eof = 1) THEN 0 ELSE sum(c.eof = 0) END,
+            CASE WHEN max(c.chunk_id = 'chnk_00000000000000000000000000' AND c.eof = 1) THEN 2 ELSE max(c.eof) END
+          FROM stream_chunks c LEFT JOIN (SELECT stream_name, min(run_id) AS run_id FROM run_streams GROUP BY stream_name) r ON r.stream_name = c.stream_name
+          GROUP BY c.stream_name;
+          INSERT INTO chunks (stream_id, idx, data)
+          SELECT s.id, row_number() OVER (PARTITION BY c.stream_name ORDER BY c.chunk_id) - 1, c.data
+          FROM stream_chunks c JOIN streams s ON s.name = c.stream_name
+          WHERE c.eof = 0 AND s.closed != 2;
+          DROP TABLE stream_chunks;
+        `)
+        );
+      }
+      db.prepare(
+        this.sql("UPDATE meta SET value = ? WHERE key = 'schema_version'")
+      ).run(String(SCHEMA_VERSION));
     });
     this.notifyEnabled = true;
   }
