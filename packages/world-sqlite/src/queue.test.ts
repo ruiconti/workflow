@@ -102,6 +102,136 @@ describe('durable queue', () => {
     expect(row(db).attempt).toBe(2);
   });
 
+  it('caps immediate timeoutSeconds reschedules at maxAttempts', async () => {
+    const deliver = vi.fn(async () => Response.json({ timeoutSeconds: 0 }));
+    const { world, db } = setup({ maxAttempts: 2, deliver });
+    await world.queue(queueName, { runId: 'run' });
+    await vi.waitFor(() => expect(row(db)?.status).toBe('failed'));
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(row(db)).toMatchObject({ attempt: 2, lease_owner: null });
+    expect(row(db).last_error).toContain('exhausted after 2 attempts');
+  });
+
+  it('fails recovered dead-pid leases at the attempt cap without delivery', async () => {
+    const { world, db, dbPath } = setup({ maxAttempts: 2 });
+    await world.queue(queueName, { runId: 'run' }, { delaySeconds: 60 });
+    await world.close();
+    worlds.splice(worlds.indexOf(world), 1);
+    db.run(
+      'UPDATE queue_messages SET attempt = 2, due_at = 0, lease_until = ?, lease_owner = ?',
+      Date.now() + 600_000,
+      `${os.hostname()}:2147483647:dead`
+    );
+    const deliver = vi.fn(async () => new Response('{}'));
+    const restarted = createWorld({
+      dbPath,
+      recoverActiveRuns: false,
+      deliver,
+    });
+    worlds.push(restarted);
+    await restarted.start();
+    await vi.waitFor(() => expect(row(db)?.status).toBe('failed'));
+    expect(deliver).not.toHaveBeenCalled();
+    expect(row(db)).toMatchObject({
+      attempt: 2,
+      lease_owner: null,
+      lease_until: null,
+    });
+  });
+
+  it('does not reset failed active runs on repeated start or reopen', async () => {
+    const deliver = vi.fn(async () => new Response('bad', { status: 500 }));
+    const { world, db, dbPath } = setup({
+      recoverActiveRuns: true,
+      maxAttempts: 1,
+      deliver,
+    });
+    const run = {
+      runId: 'run',
+      workflowName: 'test',
+      deploymentId: 'local',
+      specVersion: 2,
+    };
+    db.run(
+      "INSERT INTO runs (run_id, tag, status, workflow_name, created_at, data) VALUES (?, '', 'running', 'test', ?, ?)",
+      run.runId,
+      Date.now(),
+      encode(run)
+    );
+    await world.queue(queueName, { runId: run.runId });
+    await vi.waitFor(() => expect(row(db)?.status).toBe('failed'));
+    await world.start();
+    expect(db.all('SELECT * FROM queue_messages')).toHaveLength(1);
+    await world.close();
+    worlds.splice(worlds.indexOf(world), 1);
+    const restarted = createWorld({ dbPath, deliver });
+    worlds.push(restarted);
+    await restarted.start();
+    expect(db.all('SELECT * FROM queue_messages')).toHaveLength(1);
+    expect(row(db)).toMatchObject({ status: 'failed', attempt: 1 });
+    expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['not JSON', 'invalid JSON'],
+    ['{"timeoutSeconds":-1}', 'invalid timeoutSeconds'],
+    ['{"timeoutSeconds":"0"}', 'invalid timeoutSeconds'],
+    ['{"timeoutSeconds":null}', 'invalid timeoutSeconds'],
+    ['{"timeoutSeconds":1e309}', 'invalid timeoutSeconds'],
+  ])('retries malformed acknowledgement %s instead of marking done', async (body, error) => {
+    const deliver = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(body))
+      .mockImplementation(async () => new Response(''));
+    const { world, db } = setup({ maxAttempts: 2, deliver });
+    await world.queue(queueName, { runId: 'run' }, { idempotencyKey: 'key' });
+    await vi.waitFor(() => expect(row(db)?.last_error).toContain(error));
+    expect(row(db)).toMatchObject({
+      status: 'pending',
+      attempt: 1,
+      lease_owner: null,
+    });
+    expect(row(db).due_at).toBeGreaterThan(Date.now() + 500);
+    db.run('UPDATE queue_messages SET due_at = 0');
+    await vi.waitFor(() => expect(row(db)?.status).toBe('done'), {
+      timeout: 2000,
+    });
+    expect(row(db).attempt).toBe(2);
+    expect(deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    '',
+    '{}',
+    'null',
+    '42',
+  ])('acknowledges valid success body %j', async (body) => {
+    const { world, db } = setup({ deliver: async () => new Response(body) });
+    await world.queue(queueName, { runId: 'run' }, { idempotencyKey: 'key' });
+    await vi.waitFor(() => expect(row(db)?.status).toBe('done'));
+  });
+
+  it('still wakes active runs whose only messages are done', async () => {
+    const { world, db } = setup({
+      recoverActiveRuns: true,
+      deliver: async () => new Response(''),
+    });
+    await world.queue(queueName, { runId: 'run' }, { idempotencyKey: 'key' });
+    await vi.waitFor(() => expect(row(db)?.status).toBe('done'));
+    db.run(
+      "INSERT INTO runs (run_id, tag, status, workflow_name, created_at, data) VALUES ('run', '', 'running', 'test', ?, ?)",
+      Date.now(),
+      encode({
+        runId: 'run',
+        workflowName: 'test',
+        deploymentId: 'local',
+        specVersion: 2,
+      })
+    );
+    await world.start();
+    expect(db.all('SELECT * FROM queue_messages')).toHaveLength(2);
+  });
+
   it('reschedules timeoutSeconds with the same message id', async () => {
     const deliver = vi.fn(async () => new Response('{"timeoutSeconds":0.1}'));
     const { world, db } = setup({ deliver });

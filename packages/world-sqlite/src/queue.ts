@@ -145,20 +145,42 @@ export function createQueue(db: Db, config: Config) {
       ]);
       if (!response.ok)
         throw new Error(`Queue delivery returned HTTP ${response.status}`);
-      const result = (await Promise.race([
-        response.json().catch(() => null),
-        aborted,
-      ])) as { timeoutSeconds?: unknown } | null;
-      if (closed || !db.raw.isOpen) return;
+      const text = await Promise.race([response.text(), aborted]);
+      let result: unknown;
+      if (text !== '') {
+        try {
+          result = JSON.parse(text);
+        } catch {
+          throw new Error('Queue delivery returned invalid JSON');
+        }
+      }
+      let timeoutSeconds: number | undefined;
       if (
-        typeof result?.timeoutSeconds === 'number' &&
-        Number.isFinite(result.timeoutSeconds) &&
-        result.timeoutSeconds >= 0
+        result !== null &&
+        typeof result === 'object' &&
+        'timeoutSeconds' in result
       ) {
-        update(
-          'UPDATE queue_messages SET due_at = ?, lease_until = NULL, lease_owner = NULL',
-          Date.now() + result.timeoutSeconds * 1000
-        );
+        if (
+          typeof result.timeoutSeconds !== 'number' ||
+          !Number.isFinite(result.timeoutSeconds) ||
+          result.timeoutSeconds < 0
+        )
+          throw new Error('Queue delivery returned invalid timeoutSeconds');
+        timeoutSeconds = result.timeoutSeconds;
+      }
+      if (closed || !db.raw.isOpen) return;
+      if (timeoutSeconds !== undefined) {
+        if (row.attempt >= row.max_attempts) {
+          update(
+            "UPDATE queue_messages SET status = 'failed', last_error = coalesce(last_error, ?), lease_until = NULL, lease_owner = NULL",
+            `exhausted after ${row.attempt} attempts`
+          );
+        } else {
+          update(
+            'UPDATE queue_messages SET due_at = ?, lease_until = NULL, lease_owner = NULL',
+            Date.now() + timeoutSeconds * 1000
+          );
+        }
       } else if (row.idempotency_key !== null) {
         update(
           "UPDATE queue_messages SET status = 'done', completed_at = ?, lease_until = NULL, lease_owner = NULL",
@@ -201,16 +223,22 @@ export function createQueue(db: Db, config: Config) {
       Math.max(0, concurrency - inflight.size)
     );
     for (const candidate of candidates) {
-      const row = db.transaction(() =>
-        db.get<MessageRow>(
-          "UPDATE queue_messages SET attempt = attempt + 1, lease_until = ?, lease_owner = ? WHERE id = ? AND status = 'pending' AND due_at <= ? AND (lease_until IS NULL OR lease_until <= ?) RETURNING *",
+      const row = db.transaction(() => {
+        db.run(
+          "UPDATE queue_messages SET status = 'failed', last_error = coalesce(last_error, 'exhausted after ' || attempt || ' attempts'), lease_until = NULL, lease_owner = NULL WHERE id = ? AND status = 'pending' AND attempt >= max_attempts AND due_at <= ? AND (lease_until IS NULL OR lease_until <= ?)",
+          candidate.id,
+          now,
+          now
+        );
+        return db.get<MessageRow>(
+          "UPDATE queue_messages SET attempt = attempt + 1, lease_until = ?, lease_owner = ? WHERE id = ? AND status = 'pending' AND attempt < max_attempts AND due_at <= ? AND (lease_until IS NULL OR lease_until <= ?) RETURNING *",
           now + timeoutMs + 30_000,
           owner,
           candidate.id,
           now,
           now
-        )
-      );
+        );
+      });
       if (!row) continue;
       const controller = new AbortController();
       inflight.set(row.id, controller);

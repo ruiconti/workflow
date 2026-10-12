@@ -224,7 +224,7 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
       queue.start();
       if (!recoverActiveRuns) return;
       const rows = db.all<{ data: Uint8Array; queue_name: string | null }>(
-        "SELECT r.data, q.queue_name FROM runs r LEFT JOIN queue_runs q ON q.run_id = r.run_id WHERE r.tag = ? AND r.status IN ('pending', 'running') AND NOT EXISTS (SELECT 1 FROM queue_messages m WHERE m.run_id = r.run_id AND m.tag = r.tag AND m.status = 'pending')",
+        "SELECT r.data, q.queue_name FROM runs r LEFT JOIN queue_runs q ON q.run_id = r.run_id WHERE r.tag = ? AND r.status IN ('pending', 'running') AND NOT EXISTS (SELECT 1 FROM queue_messages m WHERE m.run_id = r.run_id AND m.tag = r.tag AND m.status IN ('pending', 'failed'))",
         tagValue
       );
       for (const row of rows) {
