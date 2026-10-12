@@ -60,6 +60,10 @@ export type Config = LocalWorldConfig & {
     workflowName: string;
     deploymentId?: string;
   }) => string;
+  /** The idempotency key the host's start path enqueues a run's first
+   * message under (e.g. `start-<runId>`). Recovery of a run with no message
+   * uses it, so the recovery wake and a late start enqueue dedupe. */
+  startIdempotencyKey?: (runId: string) => string;
   /** Concurrent deliveries; defaults to WORKFLOW_LOCAL_QUEUE_CONCURRENCY or 1,000. */
   queueConcurrency?: number;
   /** Already-open host connection. The world never changes pragmas or closes it. */
@@ -229,12 +233,17 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
       );
       for (const row of rows) {
         const run = decode(row.data);
+        const named = row.queue_name ?? config.recoveryQueueName?.(run);
         queue.wakeIdleRun(
-          row.queue_name ??
-            config.recoveryQueueName?.(run) ??
+          named ??
             `${getQueueTopicPrefix('workflow', resolveQueueNamespace())}${run.workflowName}`,
           { runId: run.runId },
-          { deploymentId: run.deploymentId, specVersion: run.specVersion }
+          { deploymentId: run.deploymentId, specVersion: run.specVersion },
+          // Only on the queue the start itself would use: the same key on
+          // another queue would be an idempotency conflict for the start.
+          named !== undefined
+            ? config.startIdempotencyKey?.(run.runId)
+            : undefined
         );
       }
     },

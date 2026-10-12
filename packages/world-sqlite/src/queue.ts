@@ -297,25 +297,37 @@ export function createQueue(db: Db, config: Config) {
     wake();
   }
   // One write transaction (BEGIN IMMEDIATE, so it also excludes other
-  // processes): with `ifRunIdle`, nothing is inserted when the run already has
-  // a pending or failed message, which makes recovery wakes race-free.
+  // processes). A recovery wake inserts nothing when the run already has a
+  // pending or failed message; for a run with no message at all (its start
+  // was never enqueued) it takes the start's idempotency key, so it and the
+  // start's own enqueue dedupe whichever lands first.
   function enqueue(
     queueName: string,
     message: unknown,
     opts: Parameters<Queue['queue']>[2],
-    ifRunIdle = false
+    recovery?: { startKey?: string }
   ): string | undefined {
     const payload = message as { runId?: string; stepId?: string };
     return db.transaction(() => {
-      if (
-        ifRunIdle &&
-        db.get(
-          "SELECT 1 FROM queue_messages WHERE tag = ? AND run_id = ? AND status IN ('pending', 'failed') LIMIT 1",
-          tag,
-          payload.runId ?? null
+      if (recovery) {
+        if (
+          db.get(
+            "SELECT 1 FROM queue_messages WHERE tag = ? AND run_id = ? AND status IN ('pending', 'failed') LIMIT 1",
+            tag,
+            payload.runId ?? null
+          )
         )
-      )
-        return undefined;
+          return undefined;
+        if (
+          recovery.startKey !== undefined &&
+          !db.get(
+            'SELECT 1 FROM queue_messages WHERE tag = ? AND run_id = ? LIMIT 1',
+            tag,
+            payload.runId ?? null
+          )
+        )
+          opts = { ...opts, idempotencyKey: recovery.startKey };
+      }
       const previous =
         opts?.idempotencyKey !== undefined
           ? db.get<MessageRow>(
@@ -368,10 +380,11 @@ export function createQueue(db: Db, config: Config) {
   function wakeIdleRun(
     queueName: string,
     message: { runId: string },
-    opts: Parameters<Queue['queue']>[2]
+    opts: Parameters<Queue['queue']>[2],
+    startKey?: string
   ): boolean {
     if (closed) return false;
-    const id = enqueue(queueName, message, opts, true);
+    const id = enqueue(queueName, message, opts, { startKey });
     if (id) wake();
     return id !== undefined;
   }

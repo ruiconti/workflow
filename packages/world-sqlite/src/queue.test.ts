@@ -292,6 +292,73 @@ describe('durable queue', () => {
     expect(rows).toEqual([{ idempotency_key: 'normal' }]);
   });
 
+  it.each([
+    ['recovery first', true],
+    ['start first', false],
+  ])('a never-enqueued run gets one start job, %s', async (_, recoveryFirst) => {
+    const config = {
+      recoverActiveRuns: true,
+      deliver: () => new Promise<Response>(() => {}),
+      recoveryQueueName: () => queueName,
+      startIdempotencyKey: (runId: string) => `start-${runId}`,
+    };
+    const { world, db, dbPath } = setup(config);
+    // A second process on the same database runs the start.
+    const starter = createWorld({
+      dbPath,
+      ...config,
+      recoverActiveRuns: false,
+    });
+    worlds.push(starter);
+    activeRuns(db, ['run']);
+    const start = () =>
+      starter.queue(
+        queueName,
+        { runId: 'run', traceCarrier: {} },
+        { idempotencyKey: 'start-run' }
+      );
+    if (recoveryFirst) {
+      await world.start();
+      await start();
+    } else {
+      await start();
+      await world.start();
+    }
+    expect(
+      db.all<any>('SELECT run_id, idempotency_key, status FROM queue_messages')
+    ).toEqual([
+      { run_id: 'run', idempotency_key: 'start-run', status: 'pending' },
+    ]);
+  });
+
+  it('recovery keeps distinct step and follow-up jobs for a run', async () => {
+    const { world, db } = setup({
+      recoverActiveRuns: true,
+      deliver: () => new Promise<Response>(() => {}),
+      recoveryQueueName: () => queueName,
+      startIdempotencyKey: (runId: string) => `start-${runId}`,
+    });
+    activeRuns(db, ['run']);
+    await world.start();
+    await world.queue(
+      queueName,
+      { runId: 'run', stepId: 'step_1' },
+      { idempotencyKey: 'step_1' }
+    );
+    await world.queue(
+      queueName,
+      { runId: 'run' },
+      { idempotencyKey: 'hook-delivery-d1' }
+    );
+    expect(
+      db.all<any>('SELECT idempotency_key FROM queue_messages ORDER BY rowid')
+    ).toEqual([
+      { idempotency_key: 'start-run' },
+      { idempotency_key: 'step_1' },
+      { idempotency_key: 'hook-delivery-d1' },
+    ]);
+  });
+
   it('reschedules timeoutSeconds with the same message id', async () => {
     const deliver = vi.fn(async () => new Response('{"timeoutSeconds":0.1}'));
     const { world, db } = setup({ deliver });
