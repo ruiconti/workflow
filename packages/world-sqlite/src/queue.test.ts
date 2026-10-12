@@ -216,6 +216,43 @@ describe('durable queue', () => {
     });
     expect(messages[1]).toMatchObject({ run_id: 'waiting', attempt: 0 });
   });
+  it('wakes a run with no recorded queue on the configured recovery queue', async () => {
+    const { world, db, dbPath } = setup();
+    const run = {
+      runId: 'unqueued',
+      workflowName: 'test',
+      deploymentId: 'local-bot',
+      specVersion: 2,
+    };
+    db.run(
+      "INSERT INTO runs (run_id, tag, status, workflow_name, created_at, data) VALUES (?, '', 'running', 'test', ?, ?)",
+      run.runId,
+      Date.now(),
+      encode(run)
+    );
+    await world.close();
+    worlds.splice(worlds.indexOf(world), 1);
+    const restarted = createWorld({
+      dbPath,
+      deliver: () => new Promise<Response>(() => {}),
+      recoveryQueueName: (r) =>
+        `__ns${r.deploymentId!.replace(/[^a-z]/g, '')}_wkf_workflow_${r.workflowName}`,
+    });
+    worlds.push(restarted);
+    await restarted.start();
+    expect(
+      db.all<any>(
+        'SELECT run_id, queue_name, deployment_id FROM queue_messages'
+      )
+    ).toEqual([
+      {
+        run_id: 'unqueued',
+        queue_name: '__nslocalbot_wkf_workflow_test',
+        deployment_id: 'local-bot',
+      },
+    ]);
+  });
+
   it('times out a transport that ignores abort and retains the failed record', async () => {
     const { world, db } = setup({
       deliveryTimeoutMs: 20,

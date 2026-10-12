@@ -51,6 +51,15 @@ export type Config = LocalWorldConfig & {
   maxAttempts?: number;
   /** Retain successful idempotency keys this long. Default: 24 hours. */
   idempotencyRetentionMs?: number;
+  /** Queue for waking an active run that has no recorded queue (its run was
+   * created but never enqueued). Default: the workflow topic under this
+   * process's queue namespace, which is wrong when each deployment uses its
+   * own namespace. */
+  recoveryQueueName?: (run: {
+    runId: string;
+    workflowName: string;
+    deploymentId?: string;
+  }) => string;
   /** Concurrent deliveries; defaults to WORKFLOW_LOCAL_QUEUE_CONCURRENCY or 1,000. */
   queueConcurrency?: number;
   /** Already-open host connection. The world never changes pragmas or closes it. */
@@ -222,6 +231,7 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
         const run = decode(row.data);
         await queue.queue(
           row.queue_name ??
+            config.recoveryQueueName?.(run) ??
             `${getQueueTopicPrefix('workflow', resolveQueueNamespace())}${run.workflowName}`,
           { runId: run.runId },
           { deploymentId: run.deploymentId, specVersion: run.specVersion }
