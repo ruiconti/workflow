@@ -174,6 +174,11 @@ describe('durable queue', () => {
 
   it.each([
     ['not JSON', 'invalid JSON'],
+    ['', 'invalid JSON'],
+    ['null', 'non-object acknowledgement'],
+    ['[]', 'non-object acknowledgement'],
+    ['true', 'non-object acknowledgement'],
+    ['42', 'non-object acknowledgement'],
     ['{"timeoutSeconds":-1}', 'invalid timeoutSeconds'],
     ['{"timeoutSeconds":"0"}', 'invalid timeoutSeconds'],
     ['{"timeoutSeconds":null}', 'invalid timeoutSeconds'],
@@ -182,7 +187,7 @@ describe('durable queue', () => {
     const deliver = vi
       .fn()
       .mockResolvedValueOnce(new Response(body))
-      .mockImplementation(async () => new Response(''));
+      .mockImplementation(async () => new Response('{}'));
     const { world, db } = setup({ maxAttempts: 2, deliver });
     await world.queue(queueName, { runId: 'run' }, { idempotencyKey: 'key' });
     await vi.waitFor(() => expect(row(db)?.last_error).toContain(error));
@@ -201,10 +206,8 @@ describe('durable queue', () => {
   });
 
   it.each([
-    '',
     '{}',
-    'null',
-    '42',
+    '{"ok":true}',
   ])('acknowledges valid success body %j', async (body) => {
     const { world, db } = setup({ deliver: async () => new Response(body) });
     await world.queue(queueName, { runId: 'run' }, { idempotencyKey: 'key' });
@@ -214,7 +217,7 @@ describe('durable queue', () => {
   it('still wakes active runs whose only messages are done', async () => {
     const { world, db } = setup({
       recoverActiveRuns: true,
-      deliver: async () => new Response(''),
+      deliver: async () => new Response('{}'),
     });
     await world.queue(queueName, { runId: 'run' }, { idempotencyKey: 'key' });
     await vi.waitFor(() => expect(row(db)?.status).toBe('done'));
@@ -230,6 +233,63 @@ describe('durable queue', () => {
     );
     await world.start();
     expect(db.all('SELECT * FROM queue_messages')).toHaveLength(2);
+  });
+
+  const activeRuns = (db: Db, ids: string[]) => {
+    for (const runId of ids)
+      db.run(
+        "INSERT INTO runs (run_id, tag, status, workflow_name, created_at, data) VALUES (?, '', 'running', 'test', ?, ?)",
+        runId,
+        Date.now(),
+        encode({
+          runId,
+          workflowName: 'test',
+          deploymentId: 'local',
+          specVersion: 2,
+        })
+      );
+  };
+
+  it('concurrent recoveries wake each idle run once', async () => {
+    const { world, db, dbPath } = setup({
+      recoverActiveRuns: true,
+      deliver: () => new Promise<Response>(() => {}),
+    });
+    activeRuns(db, ['a', 'b', 'c']);
+    const other = createWorld({
+      dbPath,
+      recoverActiveRuns: true,
+      deliver: () => new Promise<Response>(() => {}),
+    });
+    worlds.push(other);
+    await Promise.all([world.start(), world.start(), other.start()]);
+    expect(
+      db.all<any>(
+        'SELECT run_id, count(*) AS n FROM queue_messages GROUP BY run_id ORDER BY run_id'
+      )
+    ).toEqual([
+      { run_id: 'a', n: 1 },
+      { run_id: 'b', n: 1 },
+      { run_id: 'c', n: 1 },
+    ]);
+  });
+
+  it('a normal enqueue racing recovery leaves no extra wake', async () => {
+    const { world, db } = setup({
+      recoverActiveRuns: true,
+      deliver: () => new Promise<Response>(() => {}),
+    });
+    activeRuns(db, ['run']);
+    await Promise.all([
+      world.queue(queueName, { runId: 'run' }, { idempotencyKey: 'normal' }),
+      world.start(),
+    ]);
+    const rows = db.all<any>(
+      'SELECT idempotency_key FROM queue_messages ORDER BY rowid'
+    );
+    // The enqueue runs first (its transaction is synchronous), so recovery
+    // sees a pending message and adds nothing.
+    expect(rows).toEqual([{ idempotency_key: 'normal' }]);
   });
 
   it('reschedules timeoutSeconds with the same message id', async () => {

@@ -229,7 +229,7 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
       );
       for (const row of rows) {
         const run = decode(row.data);
-        await queue.queue(
+        queue.wakeIdleRun(
           row.queue_name ??
             config.recoveryQueueName?.(run) ??
             `${getQueueTopicPrefix('workflow', resolveQueueNamespace())}${run.workflowName}`,

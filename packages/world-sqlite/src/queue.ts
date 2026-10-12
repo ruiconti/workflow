@@ -145,21 +145,24 @@ export function createQueue(db: Db, config: Config) {
       ]);
       if (!response.ok)
         throw new Error(`Queue delivery returned HTTP ${response.status}`);
+      // The acknowledgement is a JSON object: {} or {ok} acknowledges,
+      // {timeoutSeconds: n} asks again in n seconds; anything else (an empty
+      // body, invalid JSON, null, an array, a scalar) is a failed attempt.
       const text = await Promise.race([response.text(), aborted]);
       let result: unknown;
-      if (text !== '') {
-        try {
-          result = JSON.parse(text);
-        } catch {
-          throw new Error('Queue delivery returned invalid JSON');
-        }
+      try {
+        result = JSON.parse(text);
+      } catch {
+        throw new Error('Queue delivery returned invalid JSON');
       }
-      let timeoutSeconds: number | undefined;
       if (
-        result !== null &&
-        typeof result === 'object' &&
-        'timeoutSeconds' in result
-      ) {
+        result === null ||
+        typeof result !== 'object' ||
+        Array.isArray(result)
+      )
+        throw new Error('Queue delivery returned a non-object acknowledgement');
+      let timeoutSeconds: number | undefined;
+      if ('timeoutSeconds' in result && result.timeoutSeconds !== undefined) {
         if (
           typeof result.timeoutSeconds !== 'number' ||
           !Number.isFinite(result.timeoutSeconds) ||
@@ -293,10 +296,26 @@ export function createQueue(db: Db, config: Config) {
     });
     wake();
   }
-  const queue: Queue['queue'] = async (queueName, message, opts) => {
-    if (closed) throw new Error('Queue is closed');
+  // One write transaction (BEGIN IMMEDIATE, so it also excludes other
+  // processes): with `ifRunIdle`, nothing is inserted when the run already has
+  // a pending or failed message, which makes recovery wakes race-free.
+  function enqueue(
+    queueName: string,
+    message: unknown,
+    opts: Parameters<Queue['queue']>[2],
+    ifRunIdle = false
+  ): string | undefined {
     const payload = message as { runId?: string; stepId?: string };
-    const id = db.transaction(() => {
+    return db.transaction(() => {
+      if (
+        ifRunIdle &&
+        db.get(
+          "SELECT 1 FROM queue_messages WHERE tag = ? AND run_id = ? AND status IN ('pending', 'failed') LIMIT 1",
+          tag,
+          payload.runId ?? null
+        )
+      )
+        return undefined;
       const previous =
         opts?.idempotencyKey !== undefined
           ? db.get<MessageRow>(
@@ -338,11 +357,27 @@ export function createQueue(db: Db, config: Config) {
         );
       return id;
     });
+  }
+  const queue: Queue['queue'] = async (queueName, message, opts) => {
+    if (closed) throw new Error('Queue is closed');
+    const id = enqueue(queueName, message, opts)!;
     wake();
     return { messageId: MessageId.parse(id) };
   };
+  /** Wake a run unless it already has a pending or failed message. */
+  function wakeIdleRun(
+    queueName: string,
+    message: { runId: string },
+    opts: Parameters<Queue['queue']>[2]
+  ): boolean {
+    if (closed) return false;
+    const id = enqueue(queueName, message, opts, true);
+    if (id) wake();
+    return id !== undefined;
+  }
   return {
     queue,
+    wakeIdleRun,
     createQueueHandler: local.createQueueHandler,
     getDeploymentId: local.getDeploymentId,
     registerHandler(prefix: QueuePrefix, handler: DirectHandler) {
