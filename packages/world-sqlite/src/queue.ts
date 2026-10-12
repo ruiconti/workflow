@@ -149,7 +149,7 @@ export function createQueue(db: Db, config: Config) {
         response.json().catch(() => null),
         aborted,
       ])) as { timeoutSeconds?: unknown } | null;
-      if (closed) return;
+      if (closed || !db.raw.isOpen) return;
       if (
         typeof result?.timeoutSeconds === 'number' &&
         Number.isFinite(result.timeoutSeconds) &&
@@ -166,7 +166,7 @@ export function createQueue(db: Db, config: Config) {
         );
       } else update('DELETE FROM queue_messages');
     } catch (error) {
-      if (!closed)
+      if (!closed && db.raw.isOpen)
         update(
           'UPDATE queue_messages SET status = ?, last_error = ?, due_at = ?, lease_until = NULL, lease_owner = NULL',
           row.attempt >= row.max_attempts ? 'failed' : 'pending',
@@ -182,7 +182,8 @@ export function createQueue(db: Db, config: Config) {
 
   function tick() {
     timer = undefined;
-    if (closed) return;
+    // A borrowed connection can be closed by its host before close() runs.
+    if (closed || !db.raw.isOpen) return;
     const now = Date.now();
     if (now >= nextPrune) {
       db.run(
@@ -326,10 +327,11 @@ export function createQueue(db: Db, config: Config) {
       for (const controller of inflight.values())
         controller.abort(new Error('Queue closed'));
       await Promise.all(tasks);
-      db.run(
-        "UPDATE queue_messages SET lease_until = NULL, lease_owner = NULL WHERE lease_owner = ? AND status = 'pending'",
-        owner
-      );
+      if (db.raw.isOpen)
+        db.run(
+          "UPDATE queue_messages SET lease_until = NULL, lease_owner = NULL WHERE lease_owner = ? AND status = 'pending'",
+          owner
+        );
       await local.close();
     },
   };
