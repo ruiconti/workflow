@@ -89,6 +89,8 @@ export const WORLD_TABLES = [
   'stream_ops',
   'run_streams',
   'snapshots',
+  'queue_messages',
+  'queue_runs',
 ] as const;
 
 /** Table names owned by a world using this namespace. */
@@ -104,6 +106,34 @@ function validateTablePrefix(prefix: string): void {
 }
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS queue_messages (
+  id TEXT PRIMARY KEY,
+  tag TEXT NOT NULL,
+  queue_name TEXT NOT NULL,
+  idempotency_key TEXT,
+  run_id TEXT,
+  step_id TEXT,
+  deployment_id TEXT,
+  message BLOB NOT NULL,
+  headers TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  max_attempts INTEGER NOT NULL,
+  due_at INTEGER NOT NULL,
+  lease_until INTEGER,
+  lease_owner TEXT,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'done', 'failed')),
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  UNIQUE(tag, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS queue_messages_by_due ON queue_messages(status, due_at);
+CREATE INDEX IF NOT EXISTS queue_messages_by_run ON queue_messages(run_id);
+CREATE TABLE IF NOT EXISTS queue_runs (
+  run_id TEXT PRIMARY KEY,
+  queue_name TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL

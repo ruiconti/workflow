@@ -5,14 +5,22 @@ import type { WorldWrite } from './writes.js';
 export type { WorldWrite } from './writes.js';
 
 import type { QueuePrefix, World } from '@workflow/world';
-import { mintedSpecVersion, reenqueueActiveRuns } from '@workflow/world';
 import {
-  createQueue,
+  getQueueTopicPrefix,
+  mintedSpecVersion,
+  resolveQueueNamespace,
+} from '@workflow/world';
+import {
   type DirectHandler,
   instrumentObject,
   type LocalWorldConfig,
 } from '@workflow/world-local';
-import { Db } from './db.js';
+import { createQueue, type QueueDelivery } from './queue.js';
+
+export type { QueueDelivery } from './queue.js';
+export { QueueIdempotencyConflictError } from './queue.js';
+
+import { Db, decode } from './db.js';
 import { createStorage } from './storage/index.js';
 import { createStreamer, type SqliteStreamer } from './streamer.js';
 
@@ -25,9 +33,9 @@ export {
   WORLD_TABLES,
   worldTables,
 } from './db.js';
-export { StreamClosedError, StreamOperationConflictError } from './streamer.js';
-export type { AppendOptions, AppendResult } from './streamer.js';
 export { UnsafeEntityIdError } from './storage/common.js';
+export type { AppendOptions, AppendResult } from './streamer.js';
+export { StreamClosedError, StreamOperationConflictError } from './streamer.js';
 
 export type Config = LocalWorldConfig & {
   /**
@@ -35,6 +43,16 @@ export type Config = LocalWorldConfig & {
    * `<dataDir>/workflow.sqlite`.
    */
   dbPath?: string;
+  /** Override HTTP/direct delivery; headers include stable queue message identity. */
+  deliver?: (delivery: QueueDelivery) => Promise<Response>;
+  /** Per-delivery deadline in milliseconds. Default: 300,000. */
+  deliveryTimeoutMs?: number;
+  /** Maximum deliveries before a failed message is retained. Default: 48. */
+  maxAttempts?: number;
+  /** Retain successful idempotency keys this long. Default: 24 hours. */
+  idempotencyRetentionMs?: number;
+  /** Concurrent deliveries; defaults to WORKFLOW_LOCAL_QUEUE_CONCURRENCY or 1,000. */
+  queueConcurrency?: number;
   /** Already-open host connection. The world never changes pragmas or closes it. */
   database?: DatabaseSync;
   /** Namespace for world tables and indexes. Empty by default for existing stores. */
@@ -96,12 +114,18 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
     config.onWrite,
     config.tablePrefix
   );
-  const queue = createQueue(config);
+  const queue = createQueue(db, config);
   const storage = createStorage(db, tag);
   const recoverActiveRuns = resolveRecoverActiveRuns(config);
 
   function clearTagged(): void {
     db.transaction(() => {
+      db.run(
+        'DELETE FROM queue_runs WHERE run_id IN (SELECT run_id FROM queue_messages WHERE tag = ?) OR run_id IN (SELECT run_id FROM runs WHERE tag = ?)',
+        tagValue,
+        tagValue
+      );
+      db.run('DELETE FROM queue_messages WHERE tag = ?', tagValue);
       const tokens = db.all<{ token: string }>(
         'SELECT token FROM hooks WHERE tag = ?',
         tagValue
@@ -153,6 +177,8 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
   function clearAll(): void {
     db.transaction(() => {
       for (const table of [
+        'queue_messages',
+        'queue_runs',
         'chunks',
         'stream_ops',
         ...ENTITY_TABLES,
@@ -186,16 +212,21 @@ export function createWorld(args?: Partial<Config>): SqliteWorld {
       }),
     }),
     async start() {
+      queue.start();
       if (!recoverActiveRuns) return;
-      const recoveryRuns = {
-        ...storage.runs,
-        list: ((params) =>
-          storage.runs.list({
-            ...params,
-            ownTagOnly: true,
-          } as any)) as typeof storage.runs.list,
-      };
-      await reenqueueActiveRuns(recoveryRuns, queue.queue, 'world-sqlite');
+      const rows = db.all<{ data: Uint8Array; queue_name: string | null }>(
+        "SELECT r.data, q.queue_name FROM runs r LEFT JOIN queue_runs q ON q.run_id = r.run_id WHERE r.tag = ? AND r.status IN ('pending', 'running') AND NOT EXISTS (SELECT 1 FROM queue_messages m WHERE m.run_id = r.run_id AND m.tag = r.tag AND m.status = 'pending')",
+        tagValue
+      );
+      for (const row of rows) {
+        const run = decode(row.data);
+        await queue.queue(
+          row.queue_name ??
+            `${getQueueTopicPrefix('workflow', resolveQueueNamespace())}${run.workflowName}`,
+          { runId: run.runId },
+          { deploymentId: run.deploymentId, specVersion: run.specVersion }
+        );
+      }
     },
     async close() {
       await queue.close();
